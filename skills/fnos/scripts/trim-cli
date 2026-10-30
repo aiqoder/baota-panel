@@ -33,28 +33,6 @@ reject_media_command() {
 
 reject_media_command "$@"
 
-# 桌面端设置页注入的连接参数：未显式传参时补默认值
-has_flag() {
-  flag=$1
-  shift
-  for arg in "$@"; do
-    case "$arg" in
-      "$flag"|"$flag"=*) return 0 ;;
-    esac
-  done
-  return 1
-}
-
-if [ -n "${FNOS_HOST:-}" ] && ! has_flag --host "$@"; then
-  set -- --host "$FNOS_HOST" "$@"
-fi
-if [ -n "${FNOS_PORT:-}" ] && ! has_flag --port "$@"; then
-  set -- --port "$FNOS_PORT" "$@"
-fi
-if [ -n "${FNOS_SCHEME:-}" ] && ! has_flag --scheme "$@"; then
-  set -- --scheme "$FNOS_SCHEME" "$@"
-fi
-
 OS=$(uname -s)
 ARCH=$(uname -m)
 

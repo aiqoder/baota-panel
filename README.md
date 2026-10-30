@@ -1,6 +1,6 @@
 # 服务器与飞牛 NAS 助手
 
-Every Code 智能体安装包。通过 SSH 管理普通 Linux 和宝塔面板，通过随包的 `trim-cli` 以 OAuth 管理飞牛 fnOS。
+Every Code 智能体安装包。通过 SSH 管理普通 Linux 和宝塔面板。飞牛 fnOS 只保留技能 `fnos`，不在安装包里配置主机。
 
 当前版本见 [`manifest.yaml`](manifest.yaml) 的 `version`。
 
@@ -13,11 +13,8 @@ Every Code 智能体安装包。通过 SSH 管理普通 Linux 和宝塔面板，
 | 变量 | 作用 |
 | --- | --- |
 | `BT_PANELS` | 服务器清单。每行一台，列依次为别名、主机、SSH 端口、用户、密码。端口留空为 22，用户留空为 root，密码留空则使用本机私钥。 |
-| `FNOS_HOST` | 飞牛 NAS 主机。留空为本机。 |
-| `FNOS_PORT` | NAS 端口。留空时本机 5666，远程 IP 5667，域名 443。 |
-| `FNOS_SCHEME` | `auto`、`http` 或 `https`。留空为 `auto`。 |
 
-服务器走技能 `server-ops`，飞牛 NAS 走技能 `fnos`。
+服务器走技能 `server-ops`。飞牛 NAS 走技能 `fnos`，主机和端口写在命令里，不在设置页填写。
 
 ## 本地打包
 
