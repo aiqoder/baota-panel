@@ -1,0 +1,56 @@
+name: 打包 cpk
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 校验包源
+        run: node .github/scripts/cpkpack.js -check -src .
+
+      - name: 打包
+        if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(awk '/^version:/ { print $2; exit }' manifest.yaml)
+          version=${version#v}
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            tag="${GITHUB_REF_NAME#v}"
+            if [[ "$tag" != "$version" ]]; then
+              echo "::error::标签 ${GITHUB_REF_NAME} 与 manifest.yaml 的 version ${version} 不一致，请使用 v${version}"
+              exit 1
+            fi
+          fi
+          node .github/scripts/cpkpack.js -src . -out dist -ext cpk
+          ls -lh dist
+
+      - name: 上传构建产物
+        if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: baota-panel-cpk
+          path: dist/*.cpk
+          if-no-files-found: error
+
+      - name: 发布到 Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.cpk
+          generate_release_notes: true

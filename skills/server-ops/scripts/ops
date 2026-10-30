@@ -1,0 +1,298 @@
+#!/bin/sh
+# ops — 服务器运维主入口（纯 POSIX sh + 内置 sshpass，无 Python 依赖）
+#
+# 用法：
+#   ops servers                            查看已配置服务器
+#   ops [-s 别名] exec '<命令>'             执行一条命令（退出码原样透传）
+#   ops [-s 别名] sudo '<命令>'             提权执行（默认需 --yes 确认）
+#   ops [-s 别名] script <本地脚本>          执行本地脚本（- 表示从 stdin 读）
+#   ops [-s 别名] put <本地> <远端路径>       上传文件
+#   ops [-s 别名] get <远端路径> <本地目录>    下载文件
+#   ops [-s 别名] sysinfo                   系统信息（JSON）
+#   ops [-s 别名] probe                     能力探测（系统信息 + 是否宝塔）
+#   ops [-s 别名] detect [--json]           判断该用宝塔工具还是通用命令
+#   ops [-s 别名] bt <ToolId> ['{json}']     调用宝塔面板工具（仅宝塔机）
+#   ops [-s 别名] bt-tools [关键字]           列出宝塔面板当前注册的工具
+#
+# 环境变量（由桌面端注入）：
+#   BT_PANELS     服务器清单（每行：别名 | 主机 | 端口 | 用户 | 密码）
+#   OPS_CONNECT_TIMEOUT / OPS_KEY_FILE 可选
+set -u
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+export OPS_BIN_DIR="$SCRIPT_DIR/../bin"
+. "$SCRIPT_DIR/lib/common.sh"
+. "$SCRIPT_DIR/lib/remote.sh"
+
+usage() {
+  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# ---------- 输出清洗 ----------
+# sshpass 会把「口令提示」写进 stdout，去掉它并归一化 CRLF
+ops_clean_stream() {
+  sed -e 's/\r$//' -e "/^[^ ][^ ]*@[^ ]*'s password:[[:space:]]*\$/d"
+}
+
+# ---------- 子命令 ----------
+
+cmd_sysinfo() {
+  _c=$(ops_remote_sysinfo_cmd)
+  ops_ssh_do "$1" "$2" "$3" "$4" "$_c"
+}
+
+cmd_probe() {
+  _c="$(ops_remote_sysinfo_cmd)
+echo '__OPS_PROBE__'
+$(ops_remote_probe_cmd)"
+  ops_ssh_do "$1" "$2" "$3" "$4" "$_c"
+}
+
+cmd_script() {
+  _path=$5
+  if [ "$_path" = "-" ]; then
+    _body=$(cat)
+  else
+    [ -f "$_path" ] || ops_die "错误：找不到本地脚本 $_path" 2
+    _body=$(cat "$_path")
+  fi
+  _tag="__OPS_SCRIPT_$$_EOF__"
+  _c="sh <<'$_tag'
+$_body
+$_tag"
+  ops_ssh_do "$1" "$2" "$3" "$4" "$_c"
+}
+
+cmd_put() {
+  [ -f "$5" ] || ops_die "错误：找不到本地文件 $5" 2
+  ops_scp_put "$1" "$2" "$3" "$4" "$5" "$6"
+  _rc=$?
+  [ "$_rc" -eq 0 ] && printf '已上传：%s → %s:%s\n' "$5" "$1" "$6"
+  return "$_rc"
+}
+
+cmd_get() {
+  [ -d "$6" ] || mkdir -p "$6" || ops_die "错误：无法创建本地目录 $6" 2
+  ops_scp_get "$1" "$2" "$3" "$4" "$5" "$6/"
+  _rc=$?
+  [ "$_rc" -eq 0 ] && printf '已下载：%s:%s → %s/\n' "$1" "$5" "$6"
+  return "$_rc"
+}
+
+cmd_bt() {
+  _tool=$5
+  _json=${6:-}
+  [ -n "$_json" ] || _json='{}'
+  _b64=$(printf '%s' "$_json" | base64 | tr -d '\n')
+  _c=$(ops_remote_bt_call_cmd "$_tool" "$_b64")
+  ops_ssh_do "$1" "$2" "$3" "$4" "$_c"
+}
+
+cmd_bt_tools() {
+  _c=$(ops_remote_bt_list_cmd)
+  if [ -n "${5:-}" ]; then
+    ops_ssh_do "$1" "$2" "$3" "$4" "$_c" | grep -i -- "$5"
+    return $?
+  fi
+  ops_ssh_do "$1" "$2" "$3" "$4" "$_c"
+}
+
+# 解析 probe 输出，设置全局：P_SYS / P_BT_CLI / P_PANEL / P_PLUGIN / P_PANELPY
+# 注意：探测脚本对每个键先打 0 再按条件打 1，必须取「最后一次」出现的值。
+probe_val() {
+  printf '%s\n' "$1" | awk -F= -v k="$2" '$1==k{v=$2} END{print v}'
+}
+
+parse_probe() {
+  P_SYS=$(printf '%s\n' "$1" | sed -n '1,/^__OPS_PROBE__$/p' | sed '$d')
+  _p=$(printf '%s\n' "$1" | sed -n '/^__OPS_PROBE__$/,$p' | sed '1d')
+  P_BT_CLI=$(probe_val "$_p" bt_cli)
+  P_PANEL=$(probe_val "$_p" panel_dir)
+  P_PLUGIN=$(probe_val "$_p" plugin_dir)
+  P_PANELPY=$(probe_val "$_p" panel_py)
+  P_OS=$(probe_val "$_p" os)
+}
+
+json_field() {
+  printf '%s\n' "$1" | sed -n "s/.*\"$2\": \"\([^\"]*\)\".*/\1/p" | head -1
+}
+json_num() {
+  printf '%s\n' "$1" | sed -n "s/.*\"$2\": \([0-9]*\).*/\1/p" | head -1
+}
+
+cmd_detect() {
+  _raw=$(cmd_probe "$1" "$2" "$3" "$4") || _raw=""
+  parse_probe "$_raw"
+
+  _bt=0
+  if [ "${P_BT_CLI:-0}" = "1" ] || [ "${P_PANEL:-0}" = "1" ]; then _bt=1; fi
+  _ready=0
+  if [ "${P_PLUGIN:-0}" = "1" ] && [ "${P_PANELPY:-0}" = "1" ]; then _ready=1; fi
+
+  if [ "$_bt" -eq 1 ] && [ "$_ready" -eq 1 ]; then
+    _mode=baota
+    _adv='用 ops bt 调用宝塔面板工具集（98 个运维工具）'
+  elif [ "$_bt" -eq 1 ]; then
+    _mode=baota-no-mcp
+    _adv='检测到宝塔面板但缺少 bt_agent_mcp 插件：可提示安装，当前用 ops exec 通用命令'
+  else
+    _mode=generic
+    _adv='用 ops exec/script 通用命令方式运维'
+  fi
+
+  if [ "${5:-}" = "--json" ]; then
+    printf '{\n'
+    printf '  "server": {"host": "%s", "port": "%s", "user": "%s"},\n' "$1" "$2" "$3"
+    printf '  "system": %s,\n' "$(printf '%s' "$P_SYS" | tr -d '\n' | sed 's/[[:space:]]\+/ /g')"
+    printf '  "baota": {"bt_cli": %s, "panel_dir": %s, "plugin_dir": %s, "panel_py": %s, "baota": %s, "mcp_ready": %s},\n' \
+      "$([ "${P_BT_CLI:-0}" = 1 ] && echo true || echo false)" \
+      "$([ "${P_PANEL:-0}" = 1 ] && echo true || echo false)" \
+      "$([ "${P_PLUGIN:-0}" = 1 ] && echo true || echo false)" \
+      "$([ "${P_PANELPY:-0}" = 1 ] && echo true || echo false)" \
+      "$([ "$_bt" = 1 ] && echo true || echo false)" \
+      "$([ "$_ready" = 1 ] && echo true || echo false)"
+    printf '  "mode": "%s",\n  "advice": "%s"\n}\n' "$_mode" "$_adv"
+    return 0
+  fi
+
+  printf '== 目标 %s@%s:%s ==\n' "$3" "$1" "$2"
+  case "$_mode" in
+    baota) printf '  类型：宝塔面板服务器（bt_agent_mcp 已就绪）\n' ;;
+    baota-no-mcp) printf '  类型：宝塔面板服务器（未检测到 bt_agent_mcp 插件）\n' ;;
+    *) printf '  类型：普通 Linux 服务器\n' ;;
+  esac
+  _os=$(json_field "$P_SYS" os); [ -n "$_os" ] || _os=${P_OS:--}
+  printf '  系统：%s %s｜%sC/%sMB｜负载 %s\n' \
+    "$_os" "$(json_field "$P_SYS" arch)" \
+    "$(json_num "$P_SYS" cpu_cores)" "$(json_num "$P_SYS" mem_total_mb)" \
+    "$(json_field "$P_SYS" load)"
+  printf '  建议：%s\n' "$_adv"
+}
+
+cmd_servers() {
+  printf '== 已配置的服务器 ==\n'
+  ops_list_servers
+  printf '\n== SSH 客户端 ==\n'
+  if command -v "$OPS_SSH_CMD" >/dev/null 2>&1; then
+    printf '%s\n' "$("$OPS_SSH_CMD" -V 2>&1 | head -1)（$(command -v "$OPS_SSH_CMD")）"
+  else
+    printf '未找到 ssh 客户端：Windows 请启用「OpenSSH 客户端」，macOS/Linux 请安装 openssh-client。\n'
+  fi
+  printf '\n== 口令注入 ==\n'
+  if _b=$(ops_platform_bin "$OPS_BIN_DIR"); then
+    printf 'sshpass（%s）\n' "$_b"
+  else
+    printf '不可用：缺少当前平台（%s/%s）的 sshpass 二进制\n' "$(uname -s)" "$(uname -m)"
+  fi
+}
+
+# ---------- 参数解析 ----------
+SERVER=""
+YES=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -s|--server) SERVER=${2:-}; shift 2 ;;
+    --yes|-y) YES=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) ops_die "错误：未知选项 $1（用 --help 查看用法）" 2 ;;
+    *) break ;;
+  esac
+done
+
+ACTION=${1:-}
+[ -n "$ACTION" ] || { usage; exit 2; }
+shift
+
+if [ "$ACTION" = "servers" ]; then
+  cmd_servers
+  exit $?
+fi
+
+case "$ACTION" in
+  exec|sudo|script|put|get|sysinfo|probe|detect|bt|bt-tools) ;;
+  *)
+    printf '错误：未知子命令 %s\n' "$ACTION" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+
+OPS_SSHPASS_BIN=$(ops_require_sshpass)
+
+RESOLVED=$(ops_resolve "$SERVER") || exit $?
+# 输出格式：序号 \t 别名 \t 主机 \t 端口 \t 用户 \t 密码
+I=$(printf '%s' "$RESOLVED" | cut -f1)
+SNAME=$(printf '%s' "$RESOLVED" | cut -f2)
+HOST=$(printf '%s' "$RESOLVED" | cut -f3)
+PORT=$(printf '%s' "$RESOLVED" | cut -f4)
+USER=$(printf '%s' "$RESOLVED" | cut -f5)
+PASS=$(printf '%s' "$RESOLVED" | cut -f6)
+
+printf '# 目标：%s（第 %s 台） %s@%s:%s %s\n' \
+  "$SNAME" "$I" "$USER" "$HOST" "$PORT" \
+  "$([ -n "$PASS" ] && echo 密码认证 || echo 私钥认证)" >&2
+
+case "$ACTION" in
+  exec)
+    [ $# -ge 1 ] || ops_die "错误：exec 需要一条命令。" 2
+    # ssh 会把命令交给远端登录 shell 执行，无需再包一层
+    ops_ssh_do "$HOST" "$PORT" "$USER" "$PASS" "$1"
+    exit $?
+    ;;
+  sudo)
+    [ $# -ge 1 ] || ops_die "错误：sudo 需要一条命令。" 2
+    if [ "$YES" -ne 1 ]; then
+      if [ -t 0 ]; then
+        printf '即将在 %s 执行（sudo）：\n  %s\n' "$HOST" "$1" >&2
+        printf '确认执行？[y/N] ' >&2
+        read -r _ans || _ans=""
+        case "$_ans" in y|Y|yes|YES) ;; *) exit 1 ;; esac
+      else
+        ops_die "错误：该操作需要确认。请在命令后加 --yes 以前台确认执行。" 1
+      fi
+    fi
+    ops_ssh_do "$HOST" "$PORT" "$USER" "$PASS" "sudo -n sh -c $(ops_shq "$1")"
+    exit $?
+    ;;
+  script)
+    [ $# -ge 1 ] || ops_die "错误：script 需要一个本地脚本路径（或 - 读 stdin）。" 2
+    cmd_script "$HOST" "$PORT" "$USER" "$PASS" "$1"
+    exit $?
+    ;;
+  put)
+    [ $# -ge 2 ] || ops_die "错误：put 需要 <本地文件> <远端路径>。" 2
+    cmd_put "$HOST" "$PORT" "$USER" "$PASS" "$1" "$2"
+    exit $?
+    ;;
+  get)
+    [ $# -ge 2 ] || ops_die "错误：get 需要 <远端路径> <本地目录>。" 2
+    cmd_get "$HOST" "$PORT" "$USER" "$PASS" "$1" "$2"
+    exit $?
+    ;;
+  sysinfo)
+    cmd_sysinfo "$HOST" "$PORT" "$USER" "$PASS"
+    exit $?
+    ;;
+  probe)
+    cmd_probe "$HOST" "$PORT" "$USER" "$PASS"
+    exit $?
+    ;;
+  detect)
+    cmd_detect "$HOST" "$PORT" "$USER" "$PASS" "${1:-}"
+    exit $?
+    ;;
+  bt)
+    [ $# -ge 1 ] || ops_die "错误：bt 需要 <ToolId> [JSON 参数]。" 2
+    cmd_bt "$HOST" "$PORT" "$USER" "$PASS" "$1" "${2:-}"
+    exit $?
+    ;;
+  bt-tools)
+    cmd_bt_tools "$HOST" "$PORT" "$USER" "$PASS" "${1:-}"
+    exit $?
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac
